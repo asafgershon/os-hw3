@@ -158,6 +158,15 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  // Unmap the framebuffer without freeing the pages — the kernel owns them.
+  if(p->fb_map_va && p->pagetable)
+    uvmunmap(p->pagetable, p->fb_map_va, GPU_FB_PAGES, 0);
+  p->fb_map_va = 0;
+  // Restore the kernel fb[] backing so the display daemon never reads
+  // from freed user pages after a flip.
+  if(p->fb_flip_active)
+    virtio_gpu_restore_kernel_fb();
+  p->fb_flip_active = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;

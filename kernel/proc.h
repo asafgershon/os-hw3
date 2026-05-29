@@ -104,4 +104,6 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  uint64 fb_map_va;            // VA of GPU framebuffer mapping, 0 if not mapped
+  int    fb_flip_active;       // 1 if this process has flipped the GPU backing
 };

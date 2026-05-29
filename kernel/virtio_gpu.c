@@ -291,7 +291,7 @@ static void gpu_send(void *req, int req_len);
 // ── GPU command helpers ───────────────────────────────────────────────
 
 // Send RESOURCE_DETACH_BACKING for the display resource.
-static void __attribute__((unused))
+static void
 gpu_cmd_detach(void)
 {
     static struct virtio_gpu_resource_detach_backing detach;
@@ -546,6 +546,52 @@ void virtio_gpu_init(void)
 void virtio_gpu_commit(void)
 {
     gpu_transfer_flush();
+}
+
+// Return the physical address of framebuffer page i (0-indexed).
+// Used by sys_map_display to install the pages into a user page table.
+uint64
+virtio_gpu_fb_pa(int i)
+{
+    return (uint64)fb[i];
+}
+
+// Re-point the GPU resource backing to GPU_FB_PAGES user pages starting
+// at virtual address va in the given page table.  Every page must be
+// present and user-accessible (PTE_V | PTE_U).  Uses a static buffer
+// for the mem-entry list to avoid a large on-stack allocation.
+// Returns 0 on success, -1 if any page fails validation.
+int
+virtio_gpu_flip(pagetable_t pagetable, uint64 va)
+{
+    static struct virtio_gpu_mem_entry entries[FB_PAGES];
+
+    for (int i = 0; i < FB_PAGES; i++) {
+        pte_t *pte = walk(pagetable, va + (uint64)i * PGSIZE, 0);
+        if (pte == 0 || (*pte & (PTE_V | PTE_U)) != (PTE_V | PTE_U))
+            return -1;
+        entries[i].addr   = PTE2PA(*pte);
+        entries[i].length = PGSIZE;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(entries, FB_PAGES);
+    return 0;
+}
+
+// Restore the GPU resource backing to the kernel fb[] pages.
+// Called when the process that last flipped the display exits or execs,
+// so the display daemon never reads from freed user pages.
+void
+virtio_gpu_restore_kernel_fb(void)
+{
+    static struct virtio_gpu_mem_entry entries[FB_PAGES];
+
+    for (int i = 0; i < FB_PAGES; i++) {
+        entries[i].addr   = (uint64)fb[i];
+        entries[i].length = PGSIZE;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(entries, FB_PAGES);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────

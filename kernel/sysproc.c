@@ -96,12 +96,22 @@ sys_uptime(void)
 // that is exactly GPU_FB_PAGES (300) * PGSIZE bytes (i.e. 640x480x4 =
 // 1,228,800 bytes).  The buffer must already be fully mapped in the
 // calling process's address space.
-//
-// TODO: Students implement this syscall.
 uint64
 sys_flip_display(void)
 {
-  return -1;
+  uint64 buf;
+  struct proc *p = myproc();
+
+  argaddr(0, &buf);
+
+  if (buf % PGSIZE != 0)
+    return -1;
+
+  if (virtio_gpu_flip(p->pagetable, buf) < 0)
+    return -1;
+
+  p->fb_flip_active = 1;
+  return 0;
 }
 
 // sys_map_display: map the GPU's kernel framebuffer pages (fb[]) directly
@@ -111,10 +121,42 @@ sys_flip_display(void)
 //   Pass 0 to let the kernel auto-select the next available VA above p->sz.
 //
 // Returns the mapped virtual address on success, (uint64)-1 on failure.
-//
-// TODO: Students implement this syscall.
 uint64
 sys_map_display(void)
 {
-  return -1;
+  uint64 addr;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+
+  if (addr == 0) {
+    addr = PGROUNDUP(p->sz);
+  } else {
+    if (addr % PGSIZE != 0)
+      return -1;
+    // Check every page in the target range is unmapped.
+    for (int i = 0; i < GPU_FB_PAGES; i++) {
+      pte_t *pte = walk(p->pagetable, addr + (uint64)i * PGSIZE, 0);
+      if (pte != 0 && (*pte & PTE_V) != 0)
+        return -1;
+    }
+  }
+
+  // Region must fit below the trapframe.
+  if (addr + (uint64)GPU_FB_PAGES * PGSIZE > TRAPFRAME)
+    return -1;
+
+  // Install one PTE per framebuffer page (do_free=0 on unmap: kernel owns them).
+  for (int i = 0; i < GPU_FB_PAGES; i++) {
+    uint64 pa = virtio_gpu_fb_pa(i);
+    if (mappages(p->pagetable, addr + (uint64)i * PGSIZE,
+                 PGSIZE, pa, PTE_R | PTE_W | PTE_U) < 0) {
+      if (i > 0)
+        uvmunmap(p->pagetable, addr, i, 0);
+      return -1;
+    }
+  }
+
+  p->fb_map_va = addr;
+  return addr;
 }
