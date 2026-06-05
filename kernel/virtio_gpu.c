@@ -288,6 +288,7 @@ free_desc(int i)
 // Forward declarations — defined below after the virtqueue state is set up.
 static void gpu_send(void *req, int req_len);
 static void gpu_send_nolock(void *req, int req_len); // caller holds gpu_lock
+static void gpu_transfer_flush_nolock(void);         // caller holds gpu_lock
 
 // ── GPU command helpers ───────────────────────────────────────────────
 
@@ -332,9 +333,9 @@ gpu_cmd_attach_nolock(struct virtio_gpu_mem_entry *entries, int n)
 
 // Transfer the current resource backing to the host GPU and blit to the
 // display window.  This is the only place TRANSFER_TO_HOST_2D and
-// RESOURCE_FLUSH are ever sent.
+// RESOURCE_FLUSH are ever sent.  Caller must hold gpu_lock.
 static void
-gpu_transfer_flush(void)
+gpu_transfer_flush_nolock(void)
 {
     static struct virtio_gpu_transfer_to_host_2d xfer;
     memset(&xfer, 0, sizeof(xfer));
@@ -344,7 +345,7 @@ gpu_transfer_flush(void)
     xfer.r.width = SCREEN_W;
     xfer.r.height = SCREEN_H;
     xfer.resource_id = RESOURCE_ID;
-    gpu_send(&xfer, sizeof(xfer));
+    gpu_send_nolock(&xfer, sizeof(xfer));
 
     static struct virtio_gpu_resource_flush flush;
     memset(&flush, 0, sizeof(flush));
@@ -354,7 +355,18 @@ gpu_transfer_flush(void)
     flush.r.width = SCREEN_W;
     flush.r.height = SCREEN_H;
     flush.resource_id = RESOURCE_ID;
-    gpu_send(&flush, sizeof(flush));
+    gpu_send_nolock(&flush, sizeof(flush));
+}
+
+// Transfer the current resource backing to the host GPU and blit to the
+// display window.  This is the only place TRANSFER_TO_HOST_2D and
+// RESOURCE_FLUSH are ever sent.
+static void
+gpu_transfer_flush(void)
+{
+    acquire(&gpu_lock);
+    gpu_transfer_flush_nolock();
+    release(&gpu_lock);
 }
 
 // ── Pixel writer ─────────────────────────────────────────────────────
@@ -594,6 +606,7 @@ int
 virtio_gpu_flip(pagetable_t pagetable, uint64 va)
 {
     static struct virtio_gpu_mem_entry entries[FB_PAGES];
+    static struct virtio_gpu_set_scanout scanout_req;
 
     acquire(&gpu_lock);
     // The syscall layer already validated PTE_V|PTE_U; here we only need
@@ -607,21 +620,28 @@ virtio_gpu_flip(pagetable_t pagetable, uint64 va)
         entries[i].addr   = PTE2PA(*pte);
         entries[i].length = PGSIZE;
     }
+
+    // Disable the scanout before touching the backing; some QEMU versions
+    // reject RESOURCE_DETACH_BACKING while the resource is being scanned out.
+    memset(&scanout_req, 0, sizeof(scanout_req));
+    scanout_req.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout_req.r.width = SCREEN_W;
+    scanout_req.r.height = SCREEN_H;
+    scanout_req.scanout_id = SCANOUT_ID;
+    scanout_req.resource_id = 0;  // 0 disables the scanout
+    gpu_send_nolock(&scanout_req, sizeof(scanout_req));
+
     // Atomically swap backing: no window where the resource is unbacked.
     gpu_cmd_detach_nolock();
     gpu_cmd_attach_nolock(entries, FB_PAGES);
 
-    // Re-link scanout to force host-side update of the backing pages
-    static struct virtio_gpu_set_scanout scanout_req;
-    memset(&scanout_req, 0, sizeof(scanout_req));
-    scanout_req.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
-    scanout_req.r.x = 0;
-    scanout_req.r.y = 0;
-    scanout_req.r.width = SCREEN_W;
-    scanout_req.r.height = SCREEN_H;
-    scanout_req.scanout_id = SCANOUT_ID;
+    // Re-enable the scanout with the (now user-backed) resource.
     scanout_req.resource_id = RESOURCE_ID;
     gpu_send_nolock(&scanout_req, sizeof(scanout_req));
+
+    // Immediately push the new pixel data to the display without waiting
+    // for the display daemon's next tick.
+    gpu_transfer_flush_nolock();
 
     release(&gpu_lock);
     return 0;
@@ -635,26 +655,32 @@ void
 virtio_gpu_restore_kernel_fb(void)
 {
     static struct virtio_gpu_mem_entry entries[FB_PAGES];
+    static struct virtio_gpu_set_scanout scanout_req;
 
     acquire(&gpu_lock);
     for (int i = 0; i < FB_PAGES; i++) {
         entries[i].addr   = (uint64)fb[i];
         entries[i].length = PGSIZE;
     }
-    gpu_cmd_detach_nolock();
-    gpu_cmd_attach_nolock(entries, FB_PAGES);
 
-    // Re-link scanout to force host-side update of the backing pages
-    static struct virtio_gpu_set_scanout scanout_req;
+    // Disable the scanout before touching the backing.
     memset(&scanout_req, 0, sizeof(scanout_req));
     scanout_req.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
-    scanout_req.r.x = 0;
-    scanout_req.r.y = 0;
     scanout_req.r.width = SCREEN_W;
     scanout_req.r.height = SCREEN_H;
     scanout_req.scanout_id = SCANOUT_ID;
+    scanout_req.resource_id = 0;
+    gpu_send_nolock(&scanout_req, sizeof(scanout_req));
+
+    gpu_cmd_detach_nolock();
+    gpu_cmd_attach_nolock(entries, FB_PAGES);
+
+    // Re-enable scanout with kernel fb backing.
     scanout_req.resource_id = RESOURCE_ID;
     gpu_send_nolock(&scanout_req, sizeof(scanout_req));
+
+    // Immediately show the restored kernel fb content.
+    gpu_transfer_flush_nolock();
 
     release(&gpu_lock);
 }
