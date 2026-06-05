@@ -424,6 +424,11 @@ gpu_send_nolock(void *req, int req_len)
     }
     gq.used_idx++;
 
+    if (cmd_resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        printf("virtio_gpu: command type 0x%x failed with response type 0x%x\n",
+               ((struct virtio_gpu_ctrl_hdr *)req)->type, cmd_resp.type);
+    }
+
     free_desc(d0);
     free_desc(d1);
 }
@@ -605,6 +610,19 @@ virtio_gpu_flip(pagetable_t pagetable, uint64 va)
     // Atomically swap backing: no window where the resource is unbacked.
     gpu_cmd_detach_nolock();
     gpu_cmd_attach_nolock(entries, FB_PAGES);
+
+    // Re-link scanout to force host-side update of the backing pages
+    static struct virtio_gpu_set_scanout scanout_req;
+    memset(&scanout_req, 0, sizeof(scanout_req));
+    scanout_req.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout_req.r.x = 0;
+    scanout_req.r.y = 0;
+    scanout_req.r.width = SCREEN_W;
+    scanout_req.r.height = SCREEN_H;
+    scanout_req.scanout_id = SCANOUT_ID;
+    scanout_req.resource_id = RESOURCE_ID;
+    gpu_send_nolock(&scanout_req, sizeof(scanout_req));
+
     release(&gpu_lock);
     return 0;
 }
@@ -625,6 +643,19 @@ virtio_gpu_restore_kernel_fb(void)
     }
     gpu_cmd_detach_nolock();
     gpu_cmd_attach_nolock(entries, FB_PAGES);
+
+    // Re-link scanout to force host-side update of the backing pages
+    static struct virtio_gpu_set_scanout scanout_req;
+    memset(&scanout_req, 0, sizeof(scanout_req));
+    scanout_req.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    scanout_req.r.x = 0;
+    scanout_req.r.y = 0;
+    scanout_req.r.width = SCREEN_W;
+    scanout_req.r.height = SCREEN_H;
+    scanout_req.scanout_id = SCANOUT_ID;
+    scanout_req.resource_id = RESOURCE_ID;
+    gpu_send_nolock(&scanout_req, sizeof(scanout_req));
+
     release(&gpu_lock);
 }
 
