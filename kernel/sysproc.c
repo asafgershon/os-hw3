@@ -119,6 +119,7 @@ sys_flip_display(void)
     return -1;
 
   p->fb_flip_active = 1;
+  p->fb_flip_va = buf;  // remember which buffer is currently displayed
   return 0;
 }
 

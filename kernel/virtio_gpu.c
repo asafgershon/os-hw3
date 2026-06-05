@@ -587,6 +587,21 @@ void virtio_gpu_commit(void)
     gpu_transfer_flush();
 }
 
+// Copy the user framebuffer at virtual address va (in the given page table)
+// into the kernel fb[] pages.  Called before virtio_gpu_restore_kernel_fb()
+// so the display keeps showing the process's last rendered frame after exit.
+void
+virtio_gpu_copy_from_user(pagetable_t pt, uint64 va)
+{
+    for (int i = 0; i < FB_PAGES; i++) {
+        pte_t *pte = walk(pt, va + (uint64)i * PGSIZE, 0);
+        if (pte && (*pte & PTE_V))
+            memmove(fb[i], (void *)PTE2PA(*pte), PGSIZE);
+        else
+            memset(fb[i], 0, PGSIZE);
+    }
+}
+
 // Return the physical address of framebuffer page i (0-indexed).
 // Used by sys_map_display to install the pages into a user page table.
 uint64

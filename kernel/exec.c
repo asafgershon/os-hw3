@@ -138,9 +138,13 @@ exec(char *path, char **argv)
     p->fb_map_va = 0;
   }
   // Restore the kernel fb[] backing if this process had flipped the display.
+  // Copy the last frame first so the display keeps showing it after exec.
   if (p->fb_flip_active) {
+    if (p->fb_flip_va)
+      virtio_gpu_copy_from_user(oldpagetable, p->fb_flip_va);
     virtio_gpu_restore_kernel_fb();
     p->fb_flip_active = 0;
+    p->fb_flip_va = 0;
   }
   proc_freepagetable(oldpagetable, fb_free_sz);
 
