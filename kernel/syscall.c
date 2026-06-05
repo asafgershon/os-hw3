@@ -103,6 +103,7 @@ extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_flip_display(void);
 extern uint64 sys_map_display(void);
+extern uint64 sys_unmap_display(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -130,6 +131,7 @@ static uint64 (*syscalls[])(void) = {
 [SYS_close]   sys_close,
 [SYS_flip_display]   sys_flip_display,
 [SYS_map_display]    sys_map_display,
+[SYS_unmap_display]  sys_unmap_display,
 };
 
 void

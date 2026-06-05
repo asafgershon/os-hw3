@@ -24,6 +24,7 @@ int sleep(int);
 int uptime(void);
 int flip_display(void *buf);
 void *map_display(void *addr);
+int unmap_display(void);
 
 // ulib.c
 int stat(const char*, struct stat*);

@@ -127,9 +127,14 @@ exec(char *path, char **argv)
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   // Unmap the framebuffer from the old page table before freeing it.
-  // The kernel owns those pages so do_free=0.
+  // The kernel owns those pages so do_free=0.  Cap the uvmfree range at
+  // fb_map_va when the fb sits inside [0, oldsz) (the auto-select case)
+  // so proc_freepagetable never tries to free the already-unmapped PTEs.
+  uint64 fb_free_sz = oldsz;
   if (p->fb_map_va) {
     uvmunmap(oldpagetable, p->fb_map_va, GPU_FB_PAGES, 0);
+    if (p->fb_map_va < fb_free_sz)
+      fb_free_sz = p->fb_map_va;
     p->fb_map_va = 0;
   }
   // Restore the kernel fb[] backing if this process had flipped the display.
@@ -137,7 +142,7 @@ exec(char *path, char **argv)
     virtio_gpu_restore_kernel_fb();
     p->fb_flip_active = 0;
   }
-  proc_freepagetable(oldpagetable, oldsz);
+  proc_freepagetable(oldpagetable, fb_free_sz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

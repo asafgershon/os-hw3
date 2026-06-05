@@ -107,6 +107,14 @@ sys_flip_display(void)
   if (buf % PGSIZE != 0)
     return -1;
 
+  // Policy check: every page of the buffer must be mapped with user permission.
+  // This validation belongs here (syscall layer) rather than in the GPU driver.
+  for (int i = 0; i < GPU_FB_PAGES; i++) {
+    pte_t *pte = walk(p->pagetable, buf + (uint64)i * PGSIZE, 0);
+    if (pte == 0 || (*pte & (PTE_V | PTE_U)) != (PTE_V | PTE_U))
+      return -1;
+  }
+
   if (virtio_gpu_flip(p->pagetable, buf) < 0)
     return -1;
 
@@ -129,22 +137,35 @@ sys_map_display(void)
 
   argaddr(0, &addr);
 
-  if (addr == 0) {
+  // Reject a second mapping: the first one would become orphaned because
+  // freeproc/exec only tracks a single fb_map_va.  The caller must call
+  // unmap_display() before mapping again.
+  if (p->fb_map_va != 0)
+    return -1;
+
+  // Track whether the caller asked for auto-selection so we know
+  // whether to advance p->sz after the mapping is installed.
+  int auto_select = (addr == 0);
+
+  if (auto_select) {
+    // Dynamically pick the first free page-aligned VA above the current
+    // heap boundary, exactly as the spec requires ("above p->sz").
     addr = PGROUNDUP(p->sz);
   } else {
     if (addr % PGSIZE != 0)
       return -1;
-    // Check every page in the target range is unmapped.
-    for (int i = 0; i < GPU_FB_PAGES; i++) {
-      pte_t *pte = walk(p->pagetable, addr + (uint64)i * PGSIZE, 0);
-      if (pte != 0 && (*pte & PTE_V) != 0)
-        return -1;
-    }
   }
 
   // Region must fit below the trapframe.
   if (addr + (uint64)GPU_FB_PAGES * PGSIZE > TRAPFRAME)
     return -1;
+
+  // Check every page in the target range is currently unmapped.
+  for (int i = 0; i < GPU_FB_PAGES; i++) {
+    pte_t *pte = walk(p->pagetable, addr + (uint64)i * PGSIZE, 0);
+    if (pte != 0 && (*pte & PTE_V) != 0)
+      return -1;
+  }
 
   // Install one PTE per framebuffer page (do_free=0 on unmap: kernel owns them).
   for (int i = 0; i < GPU_FB_PAGES; i++) {
@@ -158,5 +179,27 @@ sys_map_display(void)
   }
 
   p->fb_map_va = addr;
+
+  // For the auto-select case, advance p->sz past the new mapping so that
+  // a subsequent sbrk() cannot grow the heap into the framebuffer region.
+  if (auto_select)
+    p->sz = addr + (uint64)GPU_FB_PAGES * PGSIZE;
+
   return addr;
+}
+
+// sys_unmap_display: remove the GPU framebuffer mapping that was installed
+// by a previous map_display() call.  Returns 0 on success, -1 if no
+// mapping is active.
+uint64
+sys_unmap_display(void)
+{
+  struct proc *p = myproc();
+
+  if (p->fb_map_va == 0)
+    return -1;
+
+  uvmunmap(p->pagetable, p->fb_map_va, GPU_FB_PAGES, 0);
+  p->fb_map_va = 0;
+  return 0;
 }

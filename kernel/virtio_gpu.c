@@ -285,21 +285,11 @@ free_desc(int i)
     gq.free[i] = 1;
 }
 
-// Forward declaration — defined below after the virtqueue state is set up.
+// Forward declarations — defined below after the virtqueue state is set up.
 static void gpu_send(void *req, int req_len);
+static void gpu_send_nolock(void *req, int req_len); // caller holds gpu_lock
 
 // ── GPU command helpers ───────────────────────────────────────────────
-
-// Send RESOURCE_DETACH_BACKING for the display resource.
-static void
-gpu_cmd_detach(void)
-{
-    static struct virtio_gpu_resource_detach_backing detach;
-    memset(&detach, 0, sizeof(detach));
-    detach.hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
-    detach.resource_id = RESOURCE_ID;
-    gpu_send(&detach, sizeof(detach));
-}
 
 // Send RESOURCE_ATTACH_BACKING for the display resource.
 // entries[] must contain n physical-address/length pairs describing the
@@ -313,6 +303,31 @@ gpu_cmd_attach(struct virtio_gpu_mem_entry *entries, int n)
     for (int i = 0; i < n; i++)
         attach_buf.entries[i] = entries[i];
     gpu_send(&attach_buf, sizeof(attach_buf));
+}
+
+// ── Nolock variants (caller must hold gpu_lock) ───────────────────────
+
+// Like gpu_cmd_detach but the caller already holds gpu_lock.
+static void
+gpu_cmd_detach_nolock(void)
+{
+    static struct virtio_gpu_resource_detach_backing detach;
+    memset(&detach, 0, sizeof(detach));
+    detach.hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    detach.resource_id = RESOURCE_ID;
+    gpu_send_nolock(&detach, sizeof(detach));
+}
+
+// Like gpu_cmd_attach but the caller already holds gpu_lock.
+static void
+gpu_cmd_attach_nolock(struct virtio_gpu_mem_entry *entries, int n)
+{
+    attach_buf.backing.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach_buf.backing.resource_id = RESOURCE_ID;
+    attach_buf.backing.nr_entries = n;
+    for (int i = 0; i < n; i++)
+        attach_buf.entries[i] = entries[i];
+    gpu_send_nolock(&attach_buf, sizeof(attach_buf));
 }
 
 // Transfer the current resource backing to the host GPU and blit to the
@@ -374,12 +389,10 @@ draw_char(int cx, int cy, unsigned char ch)
 
 // ── Command submission (polling, no interrupts) ───────────────────────
 
-// Submit a 2-descriptor command (request + shared response) and block
-// until the device completes it by advancing the used ring.
+// Core command submission — caller must hold gpu_lock.
 static void
-gpu_send(void *req, int req_len)
+gpu_send_nolock(void *req, int req_len)
 {
-    acquire(&gpu_lock);
     int d0 = alloc_desc();
     int d1 = alloc_desc();
 
@@ -413,6 +426,15 @@ gpu_send(void *req, int req_len)
 
     free_desc(d0);
     free_desc(d1);
+}
+
+// Submit a 2-descriptor command (request + shared response) and block
+// until the device completes it by advancing the used ring.
+static void
+gpu_send(void *req, int req_len)
+{
+    acquire(&gpu_lock);
+    gpu_send_nolock(req, req_len);
     release(&gpu_lock);
 }
 
@@ -558,40 +580,52 @@ virtio_gpu_fb_pa(int i)
 
 // Re-point the GPU resource backing to GPU_FB_PAGES user pages starting
 // at virtual address va in the given page table.  Every page must be
-// present and user-accessible (PTE_V | PTE_U).  Uses a static buffer
-// for the mem-entry list to avoid a large on-stack allocation.
+// present and user-accessible (PTE_V | PTE_U).  The entire page-walk,
+// detach, and attach are performed under a single gpu_lock acquisition
+// so the display daemon can never issue TRANSFER_TO_HOST_2D between
+// the detach and the attach (which would read unbacked memory).
 // Returns 0 on success, -1 if any page fails validation.
 int
 virtio_gpu_flip(pagetable_t pagetable, uint64 va)
 {
     static struct virtio_gpu_mem_entry entries[FB_PAGES];
 
+    acquire(&gpu_lock);
+    // The syscall layer already validated PTE_V|PTE_U; here we only need
+    // the physical address from each PTE (mechanism, not policy).
     for (int i = 0; i < FB_PAGES; i++) {
         pte_t *pte = walk(pagetable, va + (uint64)i * PGSIZE, 0);
-        if (pte == 0 || (*pte & (PTE_V | PTE_U)) != (PTE_V | PTE_U))
+        if (pte == 0) {
+            release(&gpu_lock);
             return -1;
+        }
         entries[i].addr   = PTE2PA(*pte);
         entries[i].length = PGSIZE;
     }
-    gpu_cmd_detach();
-    gpu_cmd_attach(entries, FB_PAGES);
+    // Atomically swap backing: no window where the resource is unbacked.
+    gpu_cmd_detach_nolock();
+    gpu_cmd_attach_nolock(entries, FB_PAGES);
+    release(&gpu_lock);
     return 0;
 }
 
 // Restore the GPU resource backing to the kernel fb[] pages.
 // Called when the process that last flipped the display exits or execs,
 // so the display daemon never reads from freed user pages.
+// Held under a single gpu_lock so the restore is atomic.
 void
 virtio_gpu_restore_kernel_fb(void)
 {
     static struct virtio_gpu_mem_entry entries[FB_PAGES];
 
+    acquire(&gpu_lock);
     for (int i = 0; i < FB_PAGES; i++) {
         entries[i].addr   = (uint64)fb[i];
         entries[i].length = PGSIZE;
     }
-    gpu_cmd_detach();
-    gpu_cmd_attach(entries, FB_PAGES);
+    gpu_cmd_detach_nolock();
+    gpu_cmd_attach_nolock(entries, FB_PAGES);
+    release(&gpu_lock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
